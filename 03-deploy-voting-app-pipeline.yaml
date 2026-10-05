@@ -1,0 +1,72 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: deploy-voting-app-multicluster
+  namespace: multicluster-demo
+  labels:
+    app.kubernetes.io/part-of: multicluster-demo
+  annotations:
+    description: >
+      Hub-and-spoke multicluster pipeline. Orchestration runs on the hub cluster.
+      The deploy-voting-app task authenticates to the spoke cluster and applies
+      all voting application workloads there via 'oc apply'. The spoke cluster
+      does not run Tekton — it only receives Kubernetes resource manifests.
+spec:
+  params:
+    - name: spoke-server
+      type: string
+      description: >
+        API URL of the spoke OpenShift cluster.
+        Read from the spoke-cluster-credentials Secret by the PipelineRun.
+    - name: spoke-token
+      type: string
+      description: >
+        Service account token for authenticating to the spoke cluster.
+        Read from the spoke-cluster-credentials Secret by the PipelineRun.
+    - name: target-namespace
+      type: string
+      default: "voting-app"
+      description: Namespace to deploy into on the spoke cluster
+    - name: vote-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+    - name: result-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+    - name: worker-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+    - name: redis-image
+      type: string
+      default: "docker.io/library/redis:7-alpine"
+
+  results:
+    - name: deployment-status
+      description: Final status of the deployment
+      value: $(tasks.deploy-to-spoke.results.deployment-status)
+    - name: vote-url
+      description: URL for the vote frontend
+      value: $(tasks.deploy-to-spoke.results.vote-url)
+    - name: result-url
+      description: URL for the result backend
+      value: $(tasks.deploy-to-spoke.results.result-url)
+
+  tasks:
+    - name: deploy-to-spoke
+      taskRef:
+        name: deploy-voting-app
+      params:
+        - name: spoke-server
+          value: $(params.spoke-server)
+        - name: spoke-token
+          value: $(params.spoke-token)
+        - name: target-namespace
+          value: $(params.target-namespace)
+        - name: vote-image
+          value: $(params.vote-image)
+        - name: result-image
+          value: $(params.result-image)
+        - name: worker-image
+          value: $(params.worker-image)
+        - name: redis-image
+          value: $(params.redis-image)

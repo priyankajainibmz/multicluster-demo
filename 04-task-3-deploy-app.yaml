@@ -1,0 +1,179 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: task-deploy-application
+  namespace: voting-app
+  annotations:
+    description: >
+      Task 3 of 4. Clones the voting app source from GitHub, creates a
+      ConfigMap on the spoke with the Python source files, then applies
+      k8s/vote.yaml, k8s/result.yaml, k8s/worker.yaml from the repo.
+      All steps share the same pod ephemeral filesystem — no PVC needed.
+spec:
+  params:
+    - name: spoke-server
+      type: string
+    - name: spoke-token
+      type: string
+    - name: target-namespace
+      type: string
+      default: "voting-app"
+    - name: repo-url
+      type: string
+      default: "https://github.com/priyankajainibmz/voting-app-multicluster.git"
+    - name: revision
+      type: string
+      default: "main"
+    - name: vote-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+    - name: result-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+    - name: worker-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+
+  stepTemplate:
+    image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+    env:
+      - name: SPOKE_SERVER
+        value: $(params.spoke-server)
+      - name: SPOKE_TOKEN
+        value: $(params.spoke-token)
+      - name: TARGET_NS
+        value: $(params.target-namespace)
+      - name: REPO_URL
+        value: $(params.repo-url)
+      - name: REVISION
+        value: $(params.revision)
+    # Shared ephemeral volume — all steps in this pod share /workspace/source
+    volumeMounts:
+      - name: source
+        mountPath: /workspace/source
+
+  volumes:
+    - name: source
+      emptyDir: {}
+
+  steps:
+
+    # ── Step 1: Clone voting app from GitHub ──────────────────────
+    - name: git-clone
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        echo "=================================================="
+        echo "  TASK 3/4: DEPLOY APPLICATION (git clone + apply)"
+        echo "=================================================="
+        echo ""
+        echo ">>> Cloning voting app source from GitHub..."
+        echo "    URL:      ${REPO_URL}"
+        echo "    Revision: ${REVISION}"
+        echo ""
+
+        # Install git (openshift/cli is RHEL-based)
+        microdnf install -y git --nodocs 2>/dev/null || dnf install -y git --nodocs 2>/dev/null
+        git clone --depth=1 --branch="${REVISION}" "${REPO_URL}" /workspace/source
+
+        echo ""
+        echo ">>> Clone complete. Repository contents:"
+        find /workspace/source -not -path '*/.git*' | sort
+        echo ""
+        echo ">>> App source files:"
+        ls -lh /workspace/source/app/vote/ \
+                /workspace/source/app/result/ \
+                /workspace/source/app/worker/
+        echo ""
+        echo ">>> Kubernetes manifests:"
+        ls -lh /workspace/source/k8s/
+        sleep 3
+
+    # ── Step 2: Create ConfigMap from app source on spoke ─────────
+    - name: create-app-configmap
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        oc login --token="${SPOKE_TOKEN}" --server="${SPOKE_SERVER}" --insecure-skip-tls-verify=true
+
+        echo ""
+        echo ">>> Creating ConfigMap 'voting-app-source' on spoke cluster..."
+        echo "    (Pods mount this ConfigMap to get the Python source files)"
+        sleep 2
+
+        oc delete configmap voting-app-source -n "${TARGET_NS}" --ignore-not-found=true
+
+        oc create configmap voting-app-source \
+          --from-file=vote-app.py=/workspace/source/app/vote/app.py \
+          --from-file=result-app.py=/workspace/source/app/result/app.py \
+          --from-file=worker-worker.py=/workspace/source/app/worker/worker.py \
+          -n "${TARGET_NS}"
+
+        echo ">>> ConfigMap created with keys: vote-app.py, result-app.py, worker-worker.py"
+        oc get configmap voting-app-source -n "${TARGET_NS}" --no-headers
+        echo ""
+        sleep 3
+
+    # ── Step 3: Deploy Vote frontend ──────────────────────────────
+    - name: deploy-vote
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        oc login --token="${SPOKE_TOKEN}" --server="${SPOKE_SERVER}" --insecure-skip-tls-verify=true
+
+        echo ""
+        echo ">>> [1/3] Deploying Vote frontend from k8s/vote.yaml..."
+        echo "    (manifest fetched from GitHub repo)"
+        sleep 4
+
+        oc apply -n "${TARGET_NS}" -f /workspace/source/k8s/vote.yaml
+
+        echo ">>> Vote manifest applied. Pausing 8s for pod scheduling..."
+        sleep 8
+        echo ">>> Vote pod status:"
+        oc get pods -n "${TARGET_NS}" -l app=vote 2>/dev/null || true
+
+    # ── Step 4: Deploy Result backend ─────────────────────────────
+    - name: deploy-result
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        oc login --token="${SPOKE_TOKEN}" --server="${SPOKE_SERVER}" --insecure-skip-tls-verify=true
+
+        echo ""
+        echo ">>> [2/3] Deploying Result backend from k8s/result.yaml..."
+        sleep 4
+
+        oc apply -n "${TARGET_NS}" -f /workspace/source/k8s/result.yaml
+
+        echo ">>> Result manifest applied. Pausing 8s for pod scheduling..."
+        sleep 8
+        echo ">>> Result pod status:"
+        oc get pods -n "${TARGET_NS}" -l app=result 2>/dev/null || true
+
+    # ── Step 5: Deploy Worker ─────────────────────────────────────
+    - name: deploy-worker
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        oc login --token="${SPOKE_TOKEN}" --server="${SPOKE_SERVER}" --insecure-skip-tls-verify=true
+
+        echo ""
+        echo ">>> [3/3] Deploying Worker from k8s/worker.yaml..."
+        sleep 4
+
+        oc apply -n "${TARGET_NS}" -f /workspace/source/k8s/worker.yaml
+
+        echo ">>> Worker manifest applied. Pausing 8s for pod scheduling..."
+        sleep 8
+
+        echo ""
+        echo ">>> All application manifests applied from GitHub repo."
+        echo ">>> Current pod status across all components:"
+        oc get pods -n "${TARGET_NS}" -o wide
+        sleep 5
+
+        echo ""
+        echo "=================================================="
+        echo "  TASK 3/4 COMPLETE"
+        echo "=================================================="

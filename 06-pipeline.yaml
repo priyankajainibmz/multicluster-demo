@@ -1,0 +1,117 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: deploy-voting-app-multicluster
+  namespace: voting-app
+  annotations:
+    description: >
+      4-task multicluster pipeline. Task 1 clones the voting app from GitHub
+      and deploys it to the spoke. Tasks 1-4 orchestrate entirely on the hub
+      via oc login + oc apply. Tekton is NOT required on the spoke.
+spec:
+  params:
+    - name: repo-url
+      type: string
+      default: "https://github.com/priyankajainibmz/voting-app-multicluster.git"
+    - name: revision
+      type: string
+      default: "main"
+    - name: spoke-server
+      type: string
+      description: Spoke cluster API URL
+    - name: spoke-token
+      type: string
+      description: Spoke cluster service account token
+    - name: target-namespace
+      type: string
+      default: "voting-app"
+    - name: redis-image
+      type: string
+      default: "docker.io/library/redis:7-alpine"
+    - name: vote-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+    - name: result-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+    - name: worker-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+
+  results:
+    - name: deployment-status
+      value: $(tasks.verify-and-expose.results.deployment-status)
+    - name: vote-url
+      value: $(tasks.verify-and-expose.results.vote-url)
+    - name: result-url
+      value: $(tasks.verify-and-expose.results.result-url)
+    - name: console-url
+      value: $(tasks.verify-and-expose.results.console-url)
+
+  tasks:
+
+    # ── Task 1: Preflight & Connect ───────────────────────────────
+    - name: preflight-and-connect
+      taskRef:
+        name: task-preflight-and-connect
+      params:
+        - name: spoke-server
+          value: $(params.spoke-server)
+        - name: spoke-token
+          value: $(params.spoke-token)
+        - name: target-namespace
+          value: $(params.target-namespace)
+
+    # ── Task 2: Deploy Infrastructure ────────────────────────────
+    - name: deploy-infrastructure
+      runAfter:
+        - preflight-and-connect
+      taskRef:
+        name: task-deploy-infrastructure
+      params:
+        - name: spoke-server
+          value: $(params.spoke-server)
+        - name: spoke-token
+          value: $(params.spoke-token)
+        - name: target-namespace
+          value: $(params.target-namespace)
+        - name: redis-image
+          value: $(params.redis-image)
+
+    # ── Task 3: Deploy Application (git clone + apply) ────────────
+    - name: deploy-application
+      runAfter:
+        - deploy-infrastructure
+      taskRef:
+        name: task-deploy-application
+      params:
+        - name: spoke-server
+          value: $(params.spoke-server)
+        - name: spoke-token
+          value: $(params.spoke-token)
+        - name: target-namespace
+          value: $(params.target-namespace)
+        - name: repo-url
+          value: $(params.repo-url)
+        - name: revision
+          value: $(params.revision)
+        - name: vote-image
+          value: $(params.vote-image)
+        - name: result-image
+          value: $(params.result-image)
+        - name: worker-image
+          value: $(params.worker-image)
+
+    # ── Task 4: Verify & Expose ───────────────────────────────────
+    - name: verify-and-expose
+      runAfter:
+        - deploy-application
+      taskRef:
+        name: task-verify-and-expose
+      params:
+        - name: spoke-server
+          value: $(params.spoke-server)
+        - name: spoke-token
+          value: $(params.spoke-token)
+        - name: target-namespace
+          value: $(params.target-namespace)

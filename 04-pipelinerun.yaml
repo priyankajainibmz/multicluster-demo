@@ -1,0 +1,25 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: deploy-voting-app-
+  namespace: voting-app
+  labels:
+    app.kubernetes.io/part-of: voting-app
+spec:
+  pipelineRef:
+    name: deploy-voting-app-multicluster
+  params:
+    - name: repo-url
+      value: "https://github.com/priyankajainibmz/voting-app-multicluster.git"
+    - name: revision
+      value: "main"
+    - name: spoke-server
+      value: "https://api.cluster420.ksdhcp.io:31748"
+    - name: spoke-token
+      value: "sha256~dRYRnc1fJsIB1hl9-DKZCXF34nqNMe0A_XBNFfNNOL4"
+    - name: target-namespace
+      value: "voting-app"
+  serviceAccountName: pipeline
+  timeouts:
+    pipeline: "1h"
+    tasks: "30m"

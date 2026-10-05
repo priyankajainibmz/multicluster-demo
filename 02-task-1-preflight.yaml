@@ -1,0 +1,99 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: task-preflight-and-connect
+  namespace: voting-app
+  annotations:
+    description: >
+      Task 1 of 4. Authenticates to the spoke cluster, creates the target
+      namespace, and cleans up any previous deployment. Adds deliberate
+      pacing so each step is visible in the Console.
+spec:
+  params:
+    - name: spoke-server
+      type: string
+    - name: spoke-token
+      type: string
+    - name: target-namespace
+      type: string
+      default: "voting-app"
+
+  results:
+    - name: spoke-node-ip
+      description: Internal IP of first worker node on the spoke
+
+  stepTemplate:
+    image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+    env:
+      - name: SPOKE_SERVER
+        value: $(params.spoke-server)
+      - name: SPOKE_TOKEN
+        value: $(params.spoke-token)
+      - name: TARGET_NS
+        value: $(params.target-namespace)
+
+  steps:
+
+    # ── Step 1: Authenticate ─────────────────────────────────────
+    - name: authenticate-to-spoke
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        echo "=================================================="
+        echo "  TASK 1/4: PREFLIGHT & CONNECT"
+        echo "=================================================="
+        echo ""
+        echo ">>> Authenticating to spoke cluster..."
+        echo "    Server: ${SPOKE_SERVER}"
+        sleep 3
+        oc login --token="${SPOKE_TOKEN}" \
+                 --server="${SPOKE_SERVER}" \
+                 --insecure-skip-tls-verify=true
+        echo ""
+        echo ">>> Logged in as: $(oc whoami)"
+        echo ">>> Cluster info:"
+        oc cluster-info | head -3
+        sleep 2
+        echo ""
+        echo ">>> Checking node health..."
+        oc get nodes -o wide
+        sleep 3
+
+    # ── Step 2: Create namespace ──────────────────────────────────
+    - name: prepare-namespace
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        oc login --token="${SPOKE_TOKEN}" --server="${SPOKE_SERVER}" --insecure-skip-tls-verify=true
+        echo ""
+        echo ">>> Preparing namespace '${TARGET_NS}' on spoke..."
+        sleep 2
+        oc create namespace "${TARGET_NS}" --dry-run=client -o yaml | oc apply -f -
+        echo ">>> Namespace ready."
+        echo ""
+        echo ">>> Saving node IP for later tasks..."
+        NODE_IP=$(oc get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "10.243.0.14")
+        echo -n "${NODE_IP}" | tee "$(results.spoke-node-ip.path)"
+        echo ""
+        echo ">>> Node IP: ${NODE_IP}"
+        sleep 2
+
+    # ── Step 3: Cleanup previous ──────────────────────────────────
+    - name: cleanup-previous-deploy
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        oc login --token="${SPOKE_TOKEN}" --server="${SPOKE_SERVER}" --insecure-skip-tls-verify=true
+        echo ""
+        echo ">>> Cleaning up any previous deployment in '${TARGET_NS}'..."
+        sleep 2
+        for resource in deployment service route; do
+          oc delete "${resource}" -l app.kubernetes.io/part-of=voting-app \
+            -n "${TARGET_NS}" --ignore-not-found=true 2>/dev/null || true
+        done
+        echo ">>> Cleanup complete. Spoke is clean and ready."
+        sleep 3
+        echo ""
+        echo "=================================================="
+        echo "  TASK 1/4 COMPLETE"
+        echo "=================================================="

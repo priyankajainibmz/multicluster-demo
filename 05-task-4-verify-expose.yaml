@@ -1,0 +1,157 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: task-verify-and-expose
+  namespace: voting-app
+  annotations:
+    description: >
+      Task 4 of 4. Waits for all pods to reach Running, creates OpenShift
+      Routes for browser access, and emits the final access URLs as
+      Tekton Results.
+spec:
+  params:
+    - name: spoke-server
+      type: string
+    - name: spoke-token
+      type: string
+    - name: target-namespace
+      type: string
+      default: "voting-app"
+
+  results:
+    - name: deployment-status
+      description: Final status summary
+    - name: vote-url
+      description: Public URL for the Vote frontend
+    - name: result-url
+      description: Public URL for the Result backend
+    - name: console-url
+      description: OpenShift Console URL for the spoke cluster
+
+  stepTemplate:
+    image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+    env:
+      - name: SPOKE_SERVER
+        value: $(params.spoke-server)
+      - name: SPOKE_TOKEN
+        value: $(params.spoke-token)
+      - name: TARGET_NS
+        value: $(params.target-namespace)
+
+  steps:
+
+    # ── Step 1: Wait for all pods ─────────────────────────────────
+    - name: wait-all-pods-ready
+      timeout: "10m"
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        oc login --token="${SPOKE_TOKEN}" --server="${SPOKE_SERVER}" --insecure-skip-tls-verify=true
+
+        echo "=================================================="
+        echo "  TASK 4/4: VERIFY & EXPOSE"
+        echo "=================================================="
+        echo ""
+        echo ">>> Waiting for all pods to reach Running state..."
+        echo "    (watch: Developer → Topology → voting-app on spoke Console)"
+        echo ""
+
+        for deploy in redis vote result worker; do
+          echo "  Waiting for deployment/${deploy}..."
+          oc rollout status deployment/${deploy} -n "${TARGET_NS}" --timeout=5m
+          echo "  deployment/${deploy} is Ready."
+          sleep 2
+        done
+
+        echo ""
+        echo ">>> All deployments are Available."
+        sleep 3
+
+    # ── Step 2: Create Routes ─────────────────────────────────────
+    - name: create-routes
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        oc login --token="${SPOKE_TOKEN}" --server="${SPOKE_SERVER}" --insecure-skip-tls-verify=true
+
+        echo ""
+        echo ">>> Creating OpenShift Routes for browser access..."
+        sleep 2
+
+        # Delete old routes if they exist, recreate clean
+        oc delete route vote result -n "${TARGET_NS}" --ignore-not-found=true 2>/dev/null
+
+        oc expose svc/vote   -n "${TARGET_NS}" 2>/dev/null || true
+        oc expose svc/result -n "${TARGET_NS}" 2>/dev/null || true
+
+        sleep 3
+        echo ">>> Routes created:"
+        oc get routes -n "${TARGET_NS}"
+
+    # ── Step 3: Final verification and report ─────────────────────
+    - name: final-report
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+        oc login --token="${SPOKE_TOKEN}" --server="${SPOKE_SERVER}" --insecure-skip-tls-verify=true
+
+        echo ""
+        echo ">>> Final deployment verification..."
+        sleep 3
+
+        echo ""
+        echo "┌─────────────────────────────────────────────────────┐"
+        echo "│          SPOKE CLUSTER — FINAL STATE                │"
+        echo "└─────────────────────────────────────────────────────┘"
+        echo ""
+        echo "DEPLOYMENTS:"
+        oc get deployments -n "${TARGET_NS}" -o wide
+        echo ""
+        echo "PODS:"
+        oc get pods -n "${TARGET_NS}" -o wide
+        echo ""
+        echo "SERVICES:"
+        oc get svc -n "${TARGET_NS}"
+        echo ""
+        echo "ROUTES:"
+        oc get routes -n "${TARGET_NS}"
+
+        # Build the URLs from the route hostnames
+        VOTE_HOST=$(oc get route vote -n "${TARGET_NS}" -o jsonpath='{.spec.host}' 2>/dev/null)
+        RESULT_HOST=$(oc get route result -n "${TARGET_NS}" -o jsonpath='{.spec.host}' 2>/dev/null)
+        SPOKE_APPS=$(echo "${SPOKE_SERVER}" | sed 's|https://api\.|apps.|' | sed 's|:[0-9]*$||')
+        CONSOLE_URL="https://console-openshift-console.${SPOKE_APPS}"
+
+        VOTE_URL="http://${VOTE_HOST}"
+        RESULT_URL="http://${RESULT_HOST}"
+
+        # Count running pods
+        RUNNING=$(oc get pods -n "${TARGET_NS}" --field-selector=status.phase=Running \
+          --no-headers 2>/dev/null | wc -l | tr -d ' ')
+
+        echo ""
+        echo "┌─────────────────────────────────────────────────────┐"
+        echo "│          ACCESS URLS (open in browser)              │"
+        echo "└─────────────────────────────────────────────────────┘"
+        echo ""
+        echo "  Vote app:    ${VOTE_URL}"
+        echo "  Result app:  ${RESULT_URL}"
+        echo "  OC Console:  ${CONSOLE_URL}"
+        echo ""
+        echo "  NOTE: Add to /etc/hosts on your Mac:"
+        echo "  158.176.3.98 ${VOTE_HOST} ${RESULT_HOST}"
+        echo ""
+
+        echo -n "SUCCESS: ${RUNNING}/4 pods running" | tee "$(results.deployment-status.path)"
+        echo -n "${VOTE_URL}"    | tee "$(results.vote-url.path)"
+        echo -n "${RESULT_URL}"  | tee "$(results.result-url.path)"
+        echo -n "${CONSOLE_URL}" | tee "$(results.console-url.path)"
+
+        echo ""
+        echo "=================================================="
+        echo "  TASK 4/4 COMPLETE — PIPELINE SUCCEEDED"
+        echo "=================================================="
+        echo ""
+        echo "  Multicluster Tekton Pipeline on IBM Z s390x"
+        echo "  Hub: cluster421 -> Spoke: cluster420"
+        echo "=================================================="

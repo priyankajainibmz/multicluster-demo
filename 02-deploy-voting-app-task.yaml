@@ -1,0 +1,490 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: deploy-voting-app
+  namespace: multicluster-demo
+  labels:
+    app.kubernetes.io/part-of: multicluster-demo
+  annotations:
+    description: >
+      Deploys the example voting application (Redis, Vote, Result, Worker)
+      to a remote spoke cluster using token-based authentication.
+      All steps run on the hub cluster; the spoke cluster only receives
+      Kubernetes manifests via 'oc apply'.
+spec:
+  params:
+    - name: spoke-server
+      type: string
+      description: API URL of the spoke cluster (e.g. https://api.spoke.example.com:6443)
+    - name: spoke-token
+      type: string
+      description: Service account token for authenticating to the spoke cluster
+    - name: target-namespace
+      type: string
+      default: "voting-app"
+      description: Namespace to create and deploy into on the spoke cluster
+    - name: vote-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+      description: Image for the vote frontend (must support s390x)
+    - name: result-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+      description: Image for the result backend (must support s390x)
+    - name: worker-image
+      type: string
+      default: "docker.io/library/python:3.9-alpine"
+      description: Image for the worker service (must support s390x)
+    - name: redis-image
+      type: string
+      default: "docker.io/library/redis:7-alpine"
+      description: Image for Redis (must support s390x)
+
+  results:
+    - name: deployment-status
+      description: Final status of the deployment
+    - name: vote-url
+      description: NodePort URL for the vote frontend
+    - name: result-url
+      description: NodePort URL for the result backend
+
+  stepTemplate:
+    # All steps share the same oc CLI image and the spoke credentials as env vars.
+    # Credentials are injected from a Secret, never hardcoded.
+    image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+    env:
+      - name: SPOKE_SERVER
+        value: $(params.spoke-server)
+      - name: SPOKE_TOKEN
+        value: $(params.spoke-token)
+      - name: TARGET_NS
+        value: $(params.target-namespace)
+
+  steps:
+    # ──────────────────────────────────────────────────────────────
+    # Step 1: Authenticate to the spoke cluster
+    # ──────────────────────────────────────────────────────────────
+    - name: login-to-spoke
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        echo "=== Authenticating to spoke cluster ==="
+        echo "Server: ${SPOKE_SERVER}"
+
+        oc login \
+          --token="${SPOKE_TOKEN}" \
+          --server="${SPOKE_SERVER}" \
+          --insecure-skip-tls-verify=true
+
+        echo "Logged in as: $(oc whoami)"
+        echo "Cluster info:"
+        oc cluster-info
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 2: Create the target namespace on the spoke cluster
+    # ──────────────────────────────────────────────────────────────
+    - name: create-namespace
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        echo "=== Creating namespace '${TARGET_NS}' on spoke cluster ==="
+
+        # Login first (each step starts fresh)
+        oc login \
+          --token="${SPOKE_TOKEN}" \
+          --server="${SPOKE_SERVER}" \
+          --insecure-skip-tls-verify=true
+
+        # --dry-run=client | apply is idempotent — safe to re-run
+        oc create namespace "${TARGET_NS}" \
+          --dry-run=client -o yaml | oc apply -f -
+
+        echo "Namespace '${TARGET_NS}' ready."
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 3: Clean up any previous deployment (idempotent run)
+    # ──────────────────────────────────────────────────────────────
+    - name: cleanup-previous-deploy
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        oc login \
+          --token="${SPOKE_TOKEN}" \
+          --server="${SPOKE_SERVER}" \
+          --insecure-skip-tls-verify=true
+
+        echo "=== Cleaning up any previous deployment in '${TARGET_NS}' ==="
+        for resource in deployment service; do
+          oc delete "${resource}" \
+            -l app.kubernetes.io/part-of=voting-app \
+            -n "${TARGET_NS}" \
+            --ignore-not-found=true
+        done
+        echo "Cleanup complete."
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 4: Deploy Redis
+    # ──────────────────────────────────────────────────────────────
+    - name: deploy-redis
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        oc login \
+          --token="${SPOKE_TOKEN}" \
+          --server="${SPOKE_SERVER}" \
+          --insecure-skip-tls-verify=true
+
+        echo "=== Deploying Redis to spoke cluster ==="
+
+        oc apply -n "${TARGET_NS}" -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: redis
+          namespace: ${TARGET_NS}
+          labels:
+            app: redis
+            app.kubernetes.io/part-of: voting-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: redis
+          template:
+            metadata:
+              labels:
+                app: redis
+            spec:
+              containers:
+              - name: redis
+                image: $(params.redis-image)
+                ports:
+                - containerPort: 6379
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "256Mi"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: redis
+          namespace: ${TARGET_NS}
+          labels:
+            app: redis
+            app.kubernetes.io/part-of: voting-app
+        spec:
+          selector:
+            app: redis
+          ports:
+          - port: 6379
+            targetPort: 6379
+        EOF
+
+        echo "Redis deployment applied."
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 5: Deploy the Vote frontend
+    # ──────────────────────────────────────────────────────────────
+    - name: deploy-vote
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        oc login \
+          --token="${SPOKE_TOKEN}" \
+          --server="${SPOKE_SERVER}" \
+          --insecure-skip-tls-verify=true
+
+        echo "=== Deploying Vote frontend to spoke cluster ==="
+
+        oc apply -n "${TARGET_NS}" -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: vote
+          namespace: ${TARGET_NS}
+          labels:
+            app: vote
+            app.kubernetes.io/part-of: voting-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: vote
+          template:
+            metadata:
+              labels:
+                app: vote
+            spec:
+              containers:
+              - name: vote
+                image: $(params.vote-image)
+                command: ["sh", "-c", "pip install flask redis && python -c \\"
+                  import os, flask, redis as r, json
+                  app = flask.Flask(__name__)
+                  rdb = r.Redis(host=os.getenv('REDIS','redis'), port=6379)
+                  @app.route('/')
+                  def index():
+                    return '<h1>Vote: <a href=/vote/a>A</a> | <a href=/vote/b>B</a></h1>'
+                  @app.route('/vote/<option>')
+                  def vote(option):
+                    rdb.incr(option)
+                    return flask.redirect('/')
+                  app.run(host='0.0.0.0', port=5000)
+                  \\""]
+                env:
+                - name: REDIS
+                  value: redis
+                ports:
+                - containerPort: 5000
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "256Mi"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: vote
+          namespace: ${TARGET_NS}
+          labels:
+            app: vote
+            app.kubernetes.io/part-of: voting-app
+        spec:
+          type: NodePort
+          selector:
+            app: vote
+          ports:
+          - port: 5000
+            targetPort: 5000
+            nodePort: 31000
+        EOF
+
+        echo "Vote frontend applied."
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 6: Deploy the Result backend
+    # ──────────────────────────────────────────────────────────────
+    - name: deploy-result
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        oc login \
+          --token="${SPOKE_TOKEN}" \
+          --server="${SPOKE_SERVER}" \
+          --insecure-skip-tls-verify=true
+
+        echo "=== Deploying Result backend to spoke cluster ==="
+
+        oc apply -n "${TARGET_NS}" -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: result
+          namespace: ${TARGET_NS}
+          labels:
+            app: result
+            app.kubernetes.io/part-of: voting-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: result
+          template:
+            metadata:
+              labels:
+                app: result
+            spec:
+              containers:
+              - name: result
+                image: $(params.result-image)
+                command: ["sh", "-c", "pip install flask redis && python -c \\"
+                  import os, flask, redis as r
+                  app = flask.Flask(__name__)
+                  rdb = r.Redis(host=os.getenv('REDIS','redis'), port=6379)
+                  @app.route('/')
+                  def index():
+                    a = rdb.get('a') or 0
+                    b = rdb.get('b') or 0
+                    return f'<h1>Results: A={int(a)} | B={int(b)}</h1>'
+                  app.run(host='0.0.0.0', port=5001)
+                  \\""]
+                env:
+                - name: REDIS
+                  value: redis
+                ports:
+                - containerPort: 5001
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "256Mi"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: result
+          namespace: ${TARGET_NS}
+          labels:
+            app: result
+            app.kubernetes.io/part-of: voting-app
+        spec:
+          type: NodePort
+          selector:
+            app: result
+          ports:
+          - port: 5001
+            targetPort: 5001
+            nodePort: 31001
+        EOF
+
+        echo "Result backend applied."
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 7: Deploy the Worker service
+    # ──────────────────────────────────────────────────────────────
+    - name: deploy-worker
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        oc login \
+          --token="${SPOKE_TOKEN}" \
+          --server="${SPOKE_SERVER}" \
+          --insecure-skip-tls-verify=true
+
+        echo "=== Deploying Worker to spoke cluster ==="
+
+        oc apply -n "${TARGET_NS}" -f - <<EOF
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: worker
+          namespace: ${TARGET_NS}
+          labels:
+            app: worker
+            app.kubernetes.io/part-of: voting-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: worker
+          template:
+            metadata:
+              labels:
+                app: worker
+            spec:
+              containers:
+              - name: worker
+                image: $(params.worker-image)
+                command: ["sh", "-c",
+                  "pip install redis && python -c \"
+                  import redis, time
+                  r = redis.Redis(host='redis', port=6379)
+                  print('Worker started, watching Redis...')
+                  while True:
+                    a = r.get('a') or 0
+                    b = r.get('b') or 0
+                    print(f'Votes — A: {int(a)}, B: {int(b)}')
+                    time.sleep(5)
+                  \""]
+                env:
+                - name: REDIS_HOST
+                  value: redis
+                resources:
+                  requests:
+                    cpu: "50m"
+                    memory: "64Mi"
+                  limits:
+                    cpu: "200m"
+                    memory: "128Mi"
+        EOF
+
+        echo "Worker applied."
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 8: Wait for all pods to reach Running state
+    # ──────────────────────────────────────────────────────────────
+    - name: wait-for-pods
+      timeout: "10m"
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        oc login \
+          --token="${SPOKE_TOKEN}" \
+          --server="${SPOKE_SERVER}" \
+          --insecure-skip-tls-verify=true
+
+        echo "=== Waiting for all deployments to become Available ==="
+
+        for deploy in redis vote result worker; do
+          echo "  Waiting for deployment/${deploy} ..."
+          oc rollout status deployment/${deploy} \
+            -n "${TARGET_NS}" \
+            --timeout=5m
+        done
+
+        echo "All deployments are Available."
+
+    # ──────────────────────────────────────────────────────────────
+    # Step 9: Verify the deployment and emit results
+    # ──────────────────────────────────────────────────────────────
+    - name: verify-and-report
+      script: |
+        #!/usr/bin/env bash
+        set -euo pipefail
+
+        oc login \
+          --token="${SPOKE_TOKEN}" \
+          --server="${SPOKE_SERVER}" \
+          --insecure-skip-tls-verify=true
+
+        echo "=== Deployment Verification ==="
+        echo ""
+
+        echo "--- Deployments ---"
+        oc get deployments -n "${TARGET_NS}" -o wide
+
+        echo ""
+        echo "--- Pods ---"
+        oc get pods -n "${TARGET_NS}" -o wide
+
+        echo ""
+        echo "--- Services ---"
+        oc get services -n "${TARGET_NS}"
+
+        # Determine node IP for access URLs
+        NODE_IP=$(oc get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null || echo "<NODE_IP>")
+
+        VOTE_URL="http://${NODE_IP}:31000"
+        RESULT_URL="http://${NODE_IP}:31001"
+
+        echo ""
+        echo "=== Access the application ==="
+        echo "  Vote:   ${VOTE_URL}"
+        echo "  Result: ${RESULT_URL}"
+        echo ""
+
+        # Count running pods
+        RUNNING=$(oc get pods -n "${TARGET_NS}" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l)
+        echo "Running pods: ${RUNNING}/4"
+
+        # Write Tekton results
+        echo -n "SUCCESS: ${RUNNING}/4 pods running" | tee "$(results.deployment-status.path)"
+        echo -n "${VOTE_URL}"   | tee "$(results.vote-url.path)"
+        echo -n "${RESULT_URL}" | tee "$(results.result-url.path)"

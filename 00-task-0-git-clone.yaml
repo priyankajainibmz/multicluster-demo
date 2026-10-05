@@ -1,0 +1,57 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: task-git-clone
+  namespace: voting-app
+  annotations:
+    description: >
+      Task 0 of 5. Clones the voting app source repository from GitHub
+      onto a shared Workspace so subsequent tasks can read the app
+      source files and Kubernetes manifests.
+spec:
+  params:
+    - name: repo-url
+      type: string
+      default: "https://github.com/priyankajainibmz/voting-app-multicluster.git"
+    - name: revision
+      type: string
+      default: "main"
+
+  workspaces:
+    - name: source
+      description: Workspace where the repo is cloned
+
+  steps:
+    - name: clone
+      image: docker.io/alpine/git:latest
+      script: |
+        #!/usr/bin/env sh
+        set -e
+        echo "=================================================="
+        echo "  TASK 0/5: GIT CLONE"
+        echo "=================================================="
+        echo ""
+        echo ">>> Cloning voting app from GitHub..."
+        echo "    URL:      $(params.repo-url)"
+        echo "    Revision: $(params.revision)"
+        echo ""
+
+        cd $(workspaces.source.path)
+        git clone --depth=1 --branch=$(params.revision) $(params.repo-url) .
+
+        echo ""
+        echo ">>> Clone complete. Repository contents:"
+        find . -not -path './.git*' | sort
+
+        echo ""
+        echo ">>> App source files:"
+        ls -lh app/vote/ app/result/ app/worker/
+
+        echo ""
+        echo ">>> Kubernetes manifests:"
+        ls -lh k8s/
+
+        echo ""
+        echo "=================================================="
+        echo "  TASK 0/5 COMPLETE — source ready on workspace"
+        echo "=================================================="
